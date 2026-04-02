@@ -28,89 +28,18 @@
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/transport/ascend/local_copy_engine.h"
+#include "tent/transport/ascend/utils.h"
 
 namespace mooncake {
 namespace tent {
-namespace {
-constexpr size_t MEM_CPY_LIMIT = 4096;
-constexpr int BASE_PORT = 20000;
-std::string hixlTransferStatusToString(hixl::TransferStatus status) {
-    switch (status) {
-        case hixl::TransferStatus::WAITING:
-            return "WAITING";
-        case hixl::TransferStatus::COMPLETED:
-            return "COMPLETED";
-        case hixl::TransferStatus::TIMEOUT:
-            return "TIMEOUT";
-        case hixl::TransferStatus::FAILED:
-            return "FAILED";
-        default:
-            return "UNKNOWN(" + std::to_string(static_cast<int>(status)) + ")";
-    }
-}
-uint16_t findListenPort(int32_t dev_id) {
-    char *rt_visible_devices = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
-    if (rt_visible_devices) {
-        std::vector<std::string> device_list;
-        std::stringstream ss(rt_visible_devices);
-        std::string item;
-        while (std::getline(ss, item, ',')) {
-            device_list.push_back(item);
-        }
-        if (dev_id < static_cast<int32_t>(device_list.size())) {
-            try {
-                dev_id = std::stoi(device_list[dev_id]);
-            } catch (const std::exception &e) {
-                LOG(WARNING) << "ASCEND_RT_VISIBLE_DEVICES is not valid, value:"
-                             << rt_visible_devices;
-            }
-        } else {
-            LOG(WARNING) << "Device id is " << dev_id
-                         << ", ASCEND_RT_VISIBLE_DEVICES is "
-                         << rt_visible_devices << ", which is unexpected.";
-        }
-    }
-    static std::random_device rand_gen;
-    const int min_port = BASE_PORT + dev_id * 1000;
-    const int max_port = BASE_PORT + (dev_id + 1) * 1000;
-    LOG(INFO) << "Find available between " << min_port << " and " << max_port;
-    const int max_attempts = 500;
-    std::uniform_int_distribution<> rand_dist(min_port, max_port);
-    int sockfd;
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int port = rand_dist(rand_gen);
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd == -1) {
-            continue;
-        }
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout))) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-        }
-        sockaddr_in bind_address;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-        }
-        close(sockfd);
-        return port;
-    }
-    return 0;
-}
-}  // namespace
 AscendDirectTransport::AscendDirectTransport() : installed_(false) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
+    if (local_copy_engine_) {
+        local_copy_engine_->finalize();
+        local_copy_engine_.reset();
+    }
     hixl_->Finalize();
     uninstall();
 }
@@ -151,11 +80,7 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
         LOG(ERROR) << "Call aclrtGetCurrentContext failed, ret: " << ret;
         return Status::InternalError("Get rt context failed.");
     }
-    auto host_ip = local_segment_name_;
-    const size_t colon_pos = local_segment_name_.find(':');
-    if (colon_pos != std::string::npos) {
-        host_ip = local_segment_name_.substr(0, colon_pos);
-    }
+    auto host_ip = getHostIpFromSegmentName(local_segment_name_);
     auto port = findListenPort(device_logic_id_);
     auto hixl_name = host_ip + ":" + std::to_string(port);
     local_hixl_name_ = hixl_name;
@@ -207,12 +132,14 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
                    << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("Initialize hixl failed.");
     }
-    ret = aclrtCreateStreamWithConfig(
-        &stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "AscendDirectTransport: cannot create stream, ret: "
-                   << ret;
-        return Status::InternalError("Create stream failed.");
+    local_copy_engine_ = std::make_unique<LocalCopyEngine>();
+    if (!local_copy_engine_) {
+        return Status::InternalError("Create local copy engine failed.");
+    }
+    auto local_copy_status =
+        local_copy_engine_->initialize(transfer_timeout_, device_logic_id_);
+    if (!local_copy_status.ok()) {
+        return local_copy_status;
     }
     LOG(INFO) << "Success to initialize hixl engine:" << hixl_name
               << " with device_id:" << device_logic_id_;
@@ -260,11 +187,7 @@ Status AscendDirectTransport::submitTransferTasks(
     for (auto &request : request_list) {
         hixl_batch->task_list.push_back(HixlTask{});
         auto &task = hixl_batch->task_list[hixl_batch->task_list.size() - 1];
-        uint64_t target_addr = request.target_offset;
-        task.target_addr = target_addr;
-        task.request = request;
-        task.status_word = TransferStatusEnum::PENDING;
-        task.transferred_bytes = 0;
+        initializeHixlTask(task, request);
         seg_to_tasks[task.request.target_id][task.request.opcode].push_back(
             &task);
     }
@@ -319,8 +242,15 @@ void AscendDirectTransport::startTransfer(
     auto remote_hixl = detail.device_attrs["hixl_name"];
     if (remote_hixl == local_hixl_name_) {
         VLOG(1) << "Target is local.";
+        if (!local_copy_engine_) {
+            LOG(ERROR) << "Local copy engine is not initialized.";
+            for (auto &task : tasks) {
+                task->status_word = TransferStatusEnum::FAILED;
+            }
+            return;
+        }
         auto start = std::chrono::steady_clock::now();
-        localCopy(opcode, tasks);
+        local_copy_engine_->copy(opcode, tasks);
         LOG(INFO) << "Local copy cost: "
                   << std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - start)
@@ -333,18 +263,17 @@ void AscendDirectTransport::startTransfer(
             if (!ret.ok()) {
                 return;
             }
+            {
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                connected_segments_.emplace(remote_hixl);
+            }
         }
     }
     auto op = (opcode == Request::WRITE) ? hixl::WRITE : hixl::READ;
     std::vector<hixl::TransferOpDesc> op_descs;
     op_descs.reserve(tasks.size());
     for (auto &task : tasks) {
-        hixl::TransferOpDesc op_desc{};
-        op_desc.local_addr = reinterpret_cast<uintptr_t>(task->request.source);
-        op_desc.remote_addr =
-            reinterpret_cast<uintptr_t>(task->request.target_offset);
-        op_desc.len = task->request.length;
-        op_descs.emplace_back(op_desc);
+        op_descs.emplace_back(buildTransferOpDesc(*task));
     }
     hixl::Status hixl_ret;
     hixl::TransferReq req_handle;
@@ -439,6 +368,10 @@ void AscendDirectTransport::disconnect(const std::string &remote_hixl,
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
         }
+        {
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            connected_segments_.erase(remote_hixl);
+        }
         return;
     }
     std::lock_guard<std::mutex> lock(connection_mutex_);
@@ -465,28 +398,9 @@ Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(desc.addr));
     mem_desc.len = desc.length;
     hixl::MemType mem_type;
-    if (desc.location.starts_with("cpu")) {
-        mem_type = hixl::MEM_HOST;
-    } else if (desc.location.starts_with("npu")) {
-        mem_type = hixl::MEM_DEVICE;
-    } else if (desc.location == kWildcardLocation) {
-        aclrtPtrAttributes attributes;
-        auto ret = aclrtPointerGetAttributes(
-            reinterpret_cast<void *>(desc.addr), &attributes);
-        if (ret != ACL_SUCCESS) {
-            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-            return Status::InvalidArgument("Invalid location of addr:" +
-                                           std::to_string(desc.addr));
-        }
-        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            mem_type = hixl::MEM_HOST;
-        } else {
-            mem_type = hixl::MEM_DEVICE;
-        }
-    } else {
-        LOG(ERROR) << "location:" << desc.location << " is not supported.";
-        return Status::InvalidArgument("Invalid location of addr:" +
-                                       std::to_string(desc.addr));
+    auto mem_type_status = getHixlMemType(desc, mem_type);
+    if (!mem_type_status.ok()) {
+        return mem_type_status;
     }
     hixl::MemHandle mem_handle;
     auto hixl_ret = hixl_->RegisterMem(mem_desc, mem_type, mem_handle);
@@ -506,6 +420,16 @@ Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
 }
 
 Status AscendDirectTransport::removeMemoryBuffer(BufferDesc &desc) {
+    std::vector<std::string> remote_hixls;
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        remote_hixls.assign(connected_segments_.begin(),
+                            connected_segments_.end());
+    }
+    for (const auto &remote_hixl : remote_hixls) {
+        disconnect(remote_hixl, connect_timeout_);
+    }
+
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto addr = desc.addr;
     if (addr_to_mem_handle_.find(addr) != addr_to_mem_handle_.end()) {
@@ -513,197 +437,6 @@ Status AscendDirectTransport::removeMemoryBuffer(BufferDesc &desc) {
         addr_to_mem_handle_.erase(addr);
     }
     return Status::OK();
-}
-
-void AscendDirectTransport::localCopy(Request::OpCode opcode,
-                                      const std::vector<HixlTask *> &tasks) {
-    aclrtMemcpyKind kind;
-    auto &first_task = tasks[0];
-    auto remote_ptr =
-        reinterpret_cast<void *>(first_task->request.target_offset);
-    aclrtPtrAttributes attributes;
-    auto ret =
-        aclrtPointerGetAttributes(first_task->request.source, &attributes);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    aclrtPtrAttributes dst_attributes;
-    ret = aclrtPointerGetAttributes(remote_ptr, &dst_attributes);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    if (attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
-        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
-        LOG(ERROR) << "location of local addr is not supported.";
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    if (dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
-        dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
-        LOG(ERROR) << "location of remote addr is not supported.";
-        for (auto &task : tasks) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-        return;
-    }
-    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
-        dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-        kind = ACL_MEMCPY_HOST_TO_HOST;
-    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
-               dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-        kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
-    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-        kind = (opcode == Request::OpCode::WRITE) ? ACL_MEMCPY_HOST_TO_DEVICE
-                                                  : ACL_MEMCPY_DEVICE_TO_HOST;
-    } else {
-        kind = (opcode == Request::OpCode::WRITE) ? ACL_MEMCPY_DEVICE_TO_HOST
-                                                  : ACL_MEMCPY_HOST_TO_DEVICE;
-    }
-    if (kind == ACL_MEMCPY_HOST_TO_HOST) {
-        return copyWithSync(opcode, tasks, kind);
-    }
-    if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
-        return copyWithAsync(opcode, tasks, kind);
-    }
-    auto left_num = tasks.size();
-    size_t task_index = 0;
-    while (left_num > 0) {
-        auto batch_num = std::min(left_num, MEM_CPY_LIMIT);
-        ret = copyWithBatch(opcode, tasks, kind, batch_num, task_index);
-        if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-            return copyWithAsync(opcode, tasks, kind);
-        }
-        left_num -= batch_num;
-        task_index += batch_num;
-    }
-}
-
-aclError AscendDirectTransport::copyWithBatch(
-    Request::OpCode opcode, const std::vector<HixlTask *> &tasks,
-    aclrtMemcpyKind kind, size_t batch_num, size_t task_index) const {
-    std::vector<void *> void_remote_addrs(batch_num);
-    std::vector<void *> void_local_addrs(batch_num);
-    std::vector<aclrtMemcpyBatchAttr> attrs(batch_num);
-    std::vector<size_t> attrsIds(batch_num);
-    std::vector<size_t> sizes(batch_num);
-    size_t idx = 0;
-    for (size_t i = 0; i < batch_num; i++) {
-        auto device_loc = aclrtMemLocation{
-            static_cast<uint32_t>(device_logic_id_),
-            aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_DEVICE};
-        auto host_loc = aclrtMemLocation{
-            0, aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_HOST};
-        if (kind == ACL_MEMCPY_DEVICE_TO_HOST) {
-            attrs[i] = aclrtMemcpyBatchAttr{host_loc, device_loc, {}};
-        } else {
-            attrs[i] = aclrtMemcpyBatchAttr{device_loc, host_loc, {}};
-        }
-        attrsIds[i] = idx++;
-        auto &task = tasks[task_index + i];
-        void_local_addrs[i] = task->request.source;
-        void_remote_addrs[i] =
-            reinterpret_cast<void *>(task->request.target_offset);
-        sizes[i] = task->request.length;
-    }
-    size_t fail_idx;
-    aclError ret;
-    if (opcode == Request::OpCode::WRITE) {
-        ret = aclrtMemcpyBatch(void_remote_addrs.data(), sizes.data(),
-                               void_local_addrs.data(), sizes.data(),
-                               sizes.size(), attrs.data(), attrsIds.data(),
-                               attrs.size(), &fail_idx);
-    } else {
-        ret = aclrtMemcpyBatch(void_local_addrs.data(), sizes.data(),
-                               void_remote_addrs.data(), sizes.data(),
-                               sizes.size(), attrs.data(), attrsIds.data(),
-                               attrs.size(), &fail_idx);
-    }
-    if (ret != ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-        if (ret == ACL_ERROR_NONE) {
-            VLOG(1) << "Copy with aclrtMemcpyBatch suc.";
-            for (size_t i = 0; i < batch_num; i++) {
-                auto &task = tasks[task_index + i];
-                task->status_word = TransferStatusEnum::COMPLETED;
-            }
-        } else {
-            for (size_t i = 0; i < batch_num; i++) {
-                auto &task = tasks[task_index + i];
-                task->status_word = TransferStatusEnum::FAILED;
-            }
-        }
-    }
-    return ret;
-}
-
-void AscendDirectTransport::copyWithSync(Request::OpCode opcode,
-                                         const std::vector<HixlTask *> &tasks,
-                                         aclrtMemcpyKind kind) {
-    for (auto &task : tasks) {
-        auto local_ptr = task->request.source;
-        auto remote_ptr = reinterpret_cast<void *>(task->request.target_offset);
-        auto len = task->request.length;
-        aclError ret;
-        if (opcode == Request::OpCode::WRITE) {
-            ret = aclrtMemcpy(remote_ptr, len, local_ptr, len, kind);
-        } else {
-            ret = aclrtMemcpy(local_ptr, len, remote_ptr, len, kind);
-        }
-        if (ret == ACL_ERROR_NONE) {
-            VLOG(1) << "Copy with aclrtMemcpy suc.";
-            task->status_word = TransferStatusEnum::COMPLETED;
-        } else {
-            LOG(ERROR) << "aclrtMemcpy failed, ret:" << ret;
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-    }
-}
-void AscendDirectTransport::copyWithAsync(Request::OpCode opcode,
-                                          const std::vector<HixlTask *> &tasks,
-                                          aclrtMemcpyKind kind) {
-    std::vector<HixlTask *> async_list;
-    aclError ret;
-    for (auto &task : tasks) {
-        auto local_ptr = task->request.source;
-        auto remote_ptr = reinterpret_cast<void *>(task->request.target_offset);
-        auto len = task->request.length;
-        if (opcode == Request::OpCode::WRITE) {
-            ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind,
-                                   stream_);
-        } else {
-            ret = aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind,
-                                   stream_);
-        }
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret;
-            task->status_word = TransferStatusEnum::FAILED;
-            continue;
-        }
-        async_list.emplace_back(task);
-    }
-    ret = aclrtSynchronizeStreamWithTimeout(
-        stream_, static_cast<int32_t>(transfer_timeout_));
-    if (ret == ACL_ERROR_NONE) {
-        VLOG(1) << "Copy with aclrtMemcpyAsync suc.";
-        for (auto &task : async_list) {
-            task->status_word = TransferStatusEnum::COMPLETED;
-        }
-    } else {
-        LOG(ERROR) << "Memory copy failed.";
-        (void)aclrtStreamAbort(stream_);
-        for (auto &task : async_list) {
-            task->status_word = TransferStatusEnum::FAILED;
-        }
-    }
 }
 
 }  // namespace tent

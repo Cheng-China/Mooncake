@@ -28,6 +28,8 @@
 namespace mooncake {
 namespace tent {
 
+class LocalCopyEngine;
+
 struct HixlTask {
     Request request;
     volatile TransferStatusEnum status_word;
@@ -85,22 +87,6 @@ class AscendDirectTransport : public Transport {
     void startTransfer(SegmentID target_id, Request::OpCode opcode,
                        const std::vector<HixlTask *> &tasks);
 
-    void localCopy(Request::OpCode opcode,
-                   const std::vector<HixlTask *> &tasks);
-
-    aclError copyWithBatch(Request::OpCode opcode,
-                           const std::vector<HixlTask *> &tasks,
-                           aclrtMemcpyKind kind, size_t batch_num,
-                           size_t task_index) const;
-
-    static void copyWithSync(Request::OpCode opcode,
-                             const std::vector<HixlTask *> &tasks,
-                             aclrtMemcpyKind kind);
-
-    void copyWithAsync(Request::OpCode opcode,
-                       const std::vector<HixlTask *> &tasks,
-                       aclrtMemcpyKind kind);
-
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -114,7 +100,7 @@ class AscendDirectTransport : public Transport {
     uint64_t connect_timeout_;
     uint64_t transfer_timeout_;
     std::string local_hixl_name_{};
-    aclrtStream stream_{};
+    std::unique_ptr<LocalCopyEngine> local_copy_engine_;
 
     std::mutex req_mutex_;
     std::unordered_map<hixl::TransferReq,
