@@ -23,6 +23,10 @@
 #include <memory>
 #include <thread>
 
+#ifdef WITH_ASCEND_PEERMEM
+#include <acl/acl.h>
+#endif
+
 #include "config.h"
 #include "cuda_alike.h"
 #include "transport/rdma_transport/endpoint_store.h"
@@ -256,6 +260,22 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
+    }
+#elif defined(WITH_ASCEND_PEERMEM)
+    aclrtPtrAttributes attributes;
+    auto ret = aclrtPointerGetAttributes(addr, &attributes);
+    if (ret != ACL_SUCCESS) {
+        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret
+                   << "addr:" << addr;
+        return ERR_CONTEXT;
+    }
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST ||
+        attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else {
+        LOG(ERROR) << "location of addr is not supported.";
+        return ERR_INVALID_ARGUMENT;
     }
 #else
     mrMeta.addr = addr;

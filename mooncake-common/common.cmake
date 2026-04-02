@@ -99,6 +99,7 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
+option(WITH_ASCEND_PEERMEM "option for enabling RDMA memory registration path with Ascend peermem support" OFF)
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
@@ -206,7 +207,7 @@ if (USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
-if (USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
+if (USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM OR WITH_ASCEND_PEERMEM)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
@@ -282,6 +283,10 @@ endif()
 
 if(WITH_NVIDIA_PEERMEM)
   add_compile_definitions(WITH_NVIDIA_PEERMEM)
+endif()
+
+if(WITH_ASCEND_PEERMEM)
+  add_compile_definitions(WITH_ASCEND_PEERMEM)
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")

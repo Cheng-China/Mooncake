@@ -29,5 +29,5 @@ add_subdirectory(src)
 
 if (BUILD_UNIT_TESTS)
     add_subdirectory(tests)
-    add_subdirectory(benchmarks)
+    #add_subdirectory(benchmarks)
 endif()
